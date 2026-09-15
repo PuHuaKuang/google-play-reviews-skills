@@ -17,6 +17,100 @@
 - 基于评论证据生成行动项和 PRD
 - 离线自检，无需外部账号即可验证核心解析与幂等逻辑
 
+## 整体架构
+
+核心原则：**分析层不感知平台**。平台差异全部收敛在数据源适配器里，适配器只负责把平台字段映射为统一记录，其余环节复用同一套实现。
+
+```mermaid
+flowchart TB
+    subgraph ADAPTERS["① 数据源层 · 可插拔适配器"]
+        direction LR
+        CSV["本地 CSV 导出"]
+        API["Reviews API 增量"]
+        GCS["GCS 历史报告"]
+        CUSTOM["自定义适配器 adapters/*.py"]
+    end
+
+    ADAPTERS --> UNIFY["② 统一记录层<br/>review_id · app_id · star_rating · review_text<br/>时间 · 版本 · 设备 · 语言 · source<br/>缺失字段留空，不用推测值伪造"]
+    UNIFY --> STORE[(③ 数据底座 storage.py<br/>SQLite 幂等 UPSERT + sync_log)]
+    STORE --> CLEAN["④ 清洗 preprocess.py<br/>NFKC 归一化 · 空正文过滤 · 去重<br/>语言标识 · 技术线索标记"]
+    CLEAN --> ANALYZE["⑤ 确定性分析 analyze.py<br/>总量/均分/低星率 · 时间趋势 · 主题与低星占比<br/>版本/设备/语言市场风险 · 低样本与残缺周期标记"]
+    ANALYZE --> LLM["⑥ 可选语义层 llm_label.py<br/>仅处理高价值差评队列，无 Key 时 dry-run"]
+    LLM --> DELIVER["⑦ 交付层<br/>report.json · HTML 看板 · 行动项 P0/P1/P2 · PRD"]
+
+    RUN["run_all.py 编排全流程"] -.-> ADAPTERS
+    SELF["selftest.py 离线回归自检"] -.-> STORE
+    VERIFY["verify_credentials.py 只读凭证检查"] -.-> ADAPTERS
+```
+
+各层职责与可替换边界：
+
+| 层 | 主要实现 | 是否可替换 | 替换约束 |
+| --- | --- | --- | --- |
+| ① 数据源层 | `fetch_gcs.py`、`fetch_api.py` | 是 | 只做「平台字段 → 统一记录」转换，不写入业务逻辑 |
+| ② 统一记录层 | 适配器内的字段映射 | 是 | 必须产出稳定 `review_id`，不使用 Python 内置 `hash()` |
+| ③ 数据底座 | `storage.py` | 否 | 幂等 UPSERT 与同步日志是去重和巡检的前提 |
+| ④ 清洗层 | `preprocess.py` | 否 | 纯星级评论保留用于趋势，不送入语义分析 |
+| ⑤ 确定性分析 | `analyze.py` | 否 | 先可复现统计，再语义分析 |
+| ⑥ 语义层 | `llm_label.py` | 是 | 可选，允许完全关闭而不影响 ③④⑤⑦ |
+| ⑦ 交付层 | `make_report.py`、`references/prd-template.md` | 部分可替换 | 输出结构可变，但必须保留证据与样本量 |
+
+## 处理流程
+
+从原始数据到可评审决策的完整链路，包含三个关键判定：数据质量、周期完整性、样本量。
+
+```mermaid
+flowchart TD
+    START([开始]) --> SRC{选择数据来源}
+    SRC -->|本地 CSV| IMP1["导入并识别文件名变体<br/>兼容 UTF-16 编码与正文内换行"]
+    SRC -->|Reviews API| IMP2["先跑 verify_credentials.py<br/>再拉取近期增量窗口"]
+    SRC -->|GCS 历史报告| IMP3["按月下载历史基线"]
+
+    IMP1 --> UPSERT
+    IMP2 --> UPSERT
+    IMP3 --> UPSERT
+    UPSERT["幂等 UPSERT 写入 reviews.db<br/>同步状态与错误写入 sync_log"]
+    UPSERT --> CLEAN["清洗与质量检查<br/>归一化 · 空正文过滤 · 去重"]
+
+    CLEAN --> QC{"正文覆盖率 / 重复率 / 字段覆盖率是否达标"}
+    QC -->|否| WARN["在报告中显式标注数据质量风险"]
+    QC -->|是| ANALYZE
+    WARN --> ANALYZE
+
+    ANALYZE["确定性统计与风险分析<br/>趋势 · 主题 · 版本/设备/市场"]
+    ANALYZE --> INCOMPLETE{"存在不完整周期"}
+    INCOMPLETE -->|是| EXCL["排除出环比与趋势结论"]
+    INCOMPLETE -->|否| TOPIC
+    EXCL --> TOPIC
+
+    TOPIC["主题聚类与低星占比"]
+    TOPIC --> SAMPLE{"样本量达到阈值"}
+    SAMPLE -->|否| POOL["进入验证池，标注不确定性"]
+    SAMPLE -->|是| EVID["证据审查六段链路<br/>原文 · 模式 · 影响 · 根因 · 立项 · 验收"]
+
+    EVID --> PRI{"影响规模 / 严重度 / 证据强度"}
+    PRI -->|核心路径失效或大范围退化| P0["P0：立即止损"]
+    PRI -->|高频体验问题或特定版本设备市场风险| P1["P1：排期修复"]
+    PRI -->|低样本或根因不明| P2["P2：验证池"]
+
+    P0 --> OUT
+    P1 --> OUT
+    P2 --> OUT
+    POOL --> OUT
+    OUT["输出 report.json · HTML 看板 · PRD"]
+
+    OUT --> MON{"已配置定时巡检"}
+    MON -->|是| SCHED["每日增量同步 + 发版后 72 小时专项巡检"]
+    MON -->|否| FINISH([结束])
+    SCHED --> FINISH
+```
+
+三条不可跳过的规则：
+
+1. **先确定性，后语义**：没有可复现统计做基线，主题结论无法验证。
+2. **低样本不升级**：样本量不足的问题进验证池，不因高差评率直接定为 P0。
+3. **残缺周期不污染环比**：不完整月份只做绝对量展示，不参与趋势和环比。
+
 ## 目录结构
 
 ```text
